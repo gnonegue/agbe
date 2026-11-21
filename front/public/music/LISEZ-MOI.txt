@@ -1,0 +1,11 @@
+Musique du jeu
+==============
+Déposez ici des morceaux UNIQUEMENT si vous avez l'autorisation écrite de l'artiste ou de son label
+(ou une licence libre), puis listez-les dans playlist.json :
+
+[
+  { "title": "Titre", "artist": "Artiste", "file": "titre.mp3" }
+]
+
+Noms de fichiers : lettres, chiffres, point, tiret, souligné ; formats mp3, ogg ou m4a.
+Liste vide : le jeu joue son ambiance togolaise douce créée par le navigateur.

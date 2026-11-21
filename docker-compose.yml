@@ -1,0 +1,100 @@
+# AGBE — déploiement de production (un serveur). Secrets fournis par un fichier .env NON versionné à côté de ce fichier.
+# Seul nginx (front) est exposé ; l'API et PostgreSQL restent sur un réseau interne.
+name: agbe
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agbe
+      POSTGRES_USER: agbe
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD manquant}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD manquant}
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+      - ./infra/db-init.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agbe -d agbe"]
+      interval: 10s
+      retries: 5
+    security_opt: ["no-new-privileges:true"]
+
+  # Migrations : conteneur éphémère avec le rôle propriétaire. L'API, elle, n'a jamais ces droits.
+  migrate:
+    build: ./back
+    command: ["npx", "prisma", "migrate", "deploy"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://agbe:${POSTGRES_PASSWORD}@db:5432/agbe?schema=public
+    networks: [internal]
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+
+  back:
+    build: ./back
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # Rôle applicatif à moindre privilège (voir infra/db-init.sh).
+      DATABASE_URL: postgresql://agbe_app:${APP_DB_PASSWORD}@db:5432/agbe?schema=public
+      CORS_ORIGINS: ${PUBLIC_APP_URL:?PUBLIC_APP_URL manquant}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL}
+      PUBLIC_API_URL: ${PUBLIC_APP_URL}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET manquant}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY:?TOTP_ENCRYPTION_KEY manquant}
+      TRUST_PROXY_HOPS: 1
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:?choisir un fournisseur de paiement}
+      PAYMENT_API_KEY: ${PAYMENT_API_KEY:-}
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-}
+      # E-mails (mot de passe oublié) : laisser vide pour désactiver
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      # Page /init (première initialisation) : vide = désactivée
+      INIT_SECRET: ${INIT_SECRET:-}
+    networks: [internal]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  front:
+    build: ./front
+    restart: unless-stopped
+    depends_on: [back]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      AGBE_DOMAIN: ${AGBE_DOMAIN:?AGBE_DOMAIN manquant (ex. agbe.tg)}
+      AGBE_SECURITY_CONTACT: ${AGBE_SECURITY_CONTACT:?AGBE_SECURITY_CONTACT manquant (adresse e-mail)}
+    volumes:
+      # Uniquement le certificat de ce domaine (pas la clé du compte ACME ni les autres domaines).
+      - /etc/letsencrypt/live/${AGBE_DOMAIN}:/etc/letsencrypt/live/${AGBE_DOMAIN}:ro
+      - /etc/letsencrypt/archive/${AGBE_DOMAIN}:/etc/letsencrypt/archive/${AGBE_DOMAIN}:ro
+      # Défis ACME pour le renouvellement « certbot --webroot » depuis l'hôte.
+      - /var/www/certbot:/var/www/certbot:ro
+    networks: [internal]
+    # Durcissement : système de fichiers en lecture seule, capacités minimales (à valider au premier démarrage).
+    read_only: true
+    tmpfs: [/etc/nginx/conf.d, /var/cache/nginx, /run, /tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, CHOWN, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  internal: {}
+
+volumes:
+  dbdata: {}

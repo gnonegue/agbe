@@ -1,0 +1,71 @@
+# Front AGBE sur Apache (hébergement mutualisé LWS cPanel) : équivalent de nginx/agbe.conf.template.
+# Copié tel quel dans dist/ au build ; à déposer avec le reste de dist/ dans le dossier du site (public_html).
+# L'API (/api) est servie par l'application Node.js déclarée dans cPanel : rien ici ne la réécrit.
+
+Options -Indexes -MultiViews
+DirectoryIndex index.html
+# /en sert /en/index.html sans redirection vers /en/ (l'adresse canonique des pages est sans barre finale)
+DirectorySlash Off
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # HTTPS obligatoire
+  RewriteCond %{HTTPS} !=on
+  RewriteCond %{HTTP:X-Forwarded-Proto} !=https
+  RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+
+  # Fichiers cachés (.git, .env…) : jamais servis
+  RewriteRule (^|/)\.(?!well-known/) - [F]
+
+  # API : laissée à l'application Node.js
+  RewriteRule ^api(/|$) - [L]
+
+  # Pages publiques pré-rendues : une adresse par page et par langue
+  # (la redirection ne concerne que l'adresse demandée par le visiteur, pas la réécriture interne ci-dessous)
+  RewriteCond %{ENV:REDIRECT_STATUS} ^$
+  RewriteRule ^(en|comment-jouer|conditions|annonces|contact|en/how-to-play|en/terms|en/ads|en/contact)/(index\.html)?$ /$1 [R=301,L]
+  RewriteRule ^(en|comment-jouer|conditions|annonces|contact|en/how-to-play|en/terms|en/ads|en/contact)$ $1/index.html [L]
+
+  # Fichiers existants servis tels quels, le reste par l'application (index.html)
+  RewriteCond %{REQUEST_FILENAME} -f
+  RewriteRule ^ - [L]
+  # Fichier de version absent (ancien chunk après un déploiement) : vrai 404, jamais index.html servi comme du JS
+  RewriteRule ^(assets|models)/ - [R=404,L]
+  RewriteRule ^ index.html [L]
+</IfModule>
+
+<IfModule mod_headers.c>
+  # En-têtes de sécurité (mêmes valeurs que nginx/snippets/agbe-security-headers.conf)
+  Header always set Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+  Header always set Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: https://*.mzstatic.com; connect-src 'self' https://itunes.apple.com; media-src 'self' https://*.mzstatic.com https://audio-ssl.itunes.apple.com; worker-src 'self'; manifest-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set X-Frame-Options "DENY"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header always set Permissions-Policy "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), xr-spatial-tracking=(), clipboard-read=(), clipboard-write=(self)"
+  Header always set Cross-Origin-Opener-Policy "same-origin"
+  Header always set Cross-Origin-Resource-Policy "same-origin"
+  Header always set Cross-Origin-Embedder-Policy "require-corp"
+  Header always set X-Permitted-Cross-Domain-Policies "none"
+  Header always set Origin-Agent-Cluster "?1"
+
+  # Cache : ressources hashées immuables ; pages, service worker et manifeste toujours revalidés
+  Header set Cache-Control "no-cache"
+  <FilesMatch "\.(html|webmanifest)$|^(sw|registerSW|workbox-[^/]+)\.js$|^version\.json$">
+    Header set Cache-Control "no-cache, no-store, must-revalidate"
+  </FilesMatch>
+</IfModule>
+<IfModule mod_headers.c>
+  <If "%{REQUEST_URI} =~ m#^/assets/#">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+  </If>
+</IfModule>
+
+<IfModule mod_mime.c>
+  AddType application/manifest+json .webmanifest
+  AddType image/webp .webp
+</IfModule>
+
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html text/css text/plain text/javascript application/javascript application/json application/manifest+json application/xml image/svg+xml
+</IfModule>

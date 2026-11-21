@@ -1,0 +1,5 @@
+.env
+*.log
+
+# Rapports du scanner Herozion
+.herozion/

@@ -1,0 +1,1934 @@
+// AGBE — modèle de données
+// Règles : identifiants UUID non devinables ; argent en entiers (BigInt, FCFA) ;
+// chaque mouvement d'argent = une transaction de grand livre équilibrée (somme = 0) ;
+// données personnelles (account) séparées des données de jeu (character).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────── Comptes ─────────────
+
+enum Role {
+  PLAYER
+  ADMIN
+}
+
+model Account {
+  id             String    @id @default(uuid()) @db.Uuid
+  email          String?   @unique
+  phone          String?   @unique
+  /// Nom d'utilisateur (minuscules, chiffres, « _ » et « . ») : affiché en jeu, sert aussi à se connecter.
+  username       String?   @unique @db.VarChar(20)
+  /// Identifiant stable du compte Google lié (connexion « Continuer avec Google »), null = aucun.
+  googleSub      String?   @unique @db.VarChar(64)
+  passwordHash   String
+  birthDate      DateTime  @db.Date
+  locale         String    @default("fr") @db.VarChar(5)
+  /// Devise d'affichage des montants (XOF = FCFA, EUR, USD) : présentation seulement, les soldes restent en FCFA.
+  currency       String    @default("XOF") @db.VarChar(3)
+  role           Role      @default(PLAYER)
+  /// Partie sans compte (invité) : ni e-mail ni téléphone ; certaines parties du jeu exigent un vrai compte.
+  guest          Boolean   @default(false)
+  totpSecret     String? // chiffré AES-256-GCM
+  totpEnabled    Boolean   @default(false)
+  totpLastStep   Int? // anti-rejeu : un code 2FA ne sert qu'une fois
+  /// Codes de secours à usage unique (hachés SHA-256), si le téléphone avec l'appli d'authentification est perdu.
+  totpBackupCodes String[] @default([])
+  failedLogins   Int       @default(0)
+  mfaFailures    Int       @default(0) // compteur dédié 2FA, non remis à zéro par le mot de passe
+  mfaLockedUntil DateTime?
+  tokenVersion   Int       @default(0) // incrémenté pour révoquer immédiatement tous les jetons d'accès
+  lockedUntil    DateTime?
+  /// FCFA issus d'achats réels mis de côté quand le joueur recommence sa vie (portefeuille système CARRY),
+  /// crédités au prochain personnage.
+  restartCarry   BigInt    @default(0)
+  /// Compte suspendu par l'équipe : connexion refusée, sessions coupées (motif dans le journal d'audit).
+  suspendedAt    DateTime?
+  deletedAt      DateTime? // compte supprimé : données personnelles effacées, historique comptable conservé
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  sessions       Session[]
+  passwordResets PasswordReset[]
+  consents       Consent[]
+  character      Character?
+  purchases      Purchase[]
+
+  @@map("account")
+}
+
+/// Lien de réinitialisation du mot de passe envoyé par e-mail : à usage unique, valable une heure.
+/// Seul le SHA-256 du jeton est conservé ; le jeton lui-même n'existe que dans le message.
+model PasswordReset {
+  id        String    @id @default(uuid()) @db.Uuid
+  accountId String    @db.Uuid
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  /// Demandé par un administrateur (sinon par le joueur depuis la page de connexion).
+  byAdmin   Boolean   @default(false)
+  ip        String?   @db.VarChar(64)
+  createdAt DateTime  @default(now())
+
+  @@index([accountId])
+  @@map("password_reset")
+}
+
+/// Dossier d'une consultation à l'hôpital : examen, demandes d'analyses, résultats, interprétation et ordonnance (calculés
+/// à partir des réglages `health.workup` et de la maladie du moment).
+/// Facture de soins à régler (urgence SAMU) : tant qu'elle est impayée, on ne peut pas rappeler le SAMU.
+model MedicalBill {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  /// Part du patient en FCFA (l'AMU a déjà pris sa part si le joueur est couvert).
+  amount      Int
+  fullAmount  Int
+  label       String    @db.VarChar(32)
+  createdAt   DateTime  @default(now())
+  paidAt      DateTime?
+
+  @@index([characterId, paidAt])
+  @@map("medical_bill")
+}
+
+/// Moto ou voiture achetée par le joueur : carburant, kilométrage, usure depuis le dernier entretien et dégâts.
+/// Les modèles (prix, réservoir, consommation, entretien) viennent des réglages `vehicles.catalog`.
+model OwnedVehicle {
+  id            String    @id @default(uuid()) @db.Uuid
+  characterId   String    @db.Uuid
+  character     Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  modelId       String    @db.VarChar(32)
+  kind          String    @db.VarChar(4)
+  /// Carburant restant, en millilitres.
+  fuelMl        Int
+  odometerM     Int       @default(0)
+  /// Mètres parcourus depuis le dernier entretien : l'usure et le risque de panne en dépendent.
+  sinceServiceM Int       @default(0)
+  /// Dégâts (pannes, accidents) en points de condition perdus, à réparer.
+  damage        Int       @default(0)
+  boughtPrice   Int
+  createdAt     DateTime  @default(now())
+  soldAt        DateTime?
+
+  @@index([characterId, soldAt])
+  @@map("owned_vehicle")
+}
+
+model MedicalVisit {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  day         Int
+  /// Maladie en cours au moment de la consultation (null : bonne santé) ; révélée au joueur après les analyses.
+  illnessId   String?   @db.VarChar(32)
+  /// CONSULTED (analyses demandées) → ANALYZED (résultats, interprétation, ordonnance) → TREATED, ou CLOSED (abandonnée).
+  status      String    @db.VarChar(12)
+  orders      Json
+  results     Json?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([characterId, createdAt])
+  @@map("medical_visit")
+}
+
+model Session {
+  id           String    @id @default(uuid()) @db.Uuid
+  accountId    String    @db.Uuid
+  account      Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  tokenHash    String    @unique // SHA-256 du jeton de rafraîchissement, jamais le jeton lui-même
+  familyId     String    @db.Uuid // détection de réutilisation : on révoque toute la famille
+  mfa          Boolean   @default(false)
+  authAt       DateTime  @default(now()) // date de la vraie authentification de la famille (durée max de session)
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  replacedById String?   @db.Uuid
+  userAgent    String?   @db.VarChar(256)
+  ip           String?   @db.VarChar(64)
+  createdAt    DateTime  @default(now())
+
+  @@index([accountId])
+  @@index([familyId])
+  @@map("session")
+}
+
+model Consent {
+  id         String   @id @default(uuid()) @db.Uuid
+  accountId  String   @db.Uuid
+  account    Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  kind       String   @db.VarChar(32) // terms, privacy
+  version    String   @db.VarChar(16)
+  acceptedAt DateTime @default(now())
+
+  @@index([accountId])
+  @@map("consent")
+}
+
+// ───────────── Personnage ─────────────
+
+enum ProfileType {
+  LOCAL
+  DIASPORA
+  FOREIGNER
+}
+
+enum Region {
+  MARITIME
+  PLATEAUX
+  CENTRALE
+  KARA
+  SAVANES
+}
+
+enum BirthCondition {
+  RICH
+  MIDDLE
+  POOR
+}
+
+enum BirthMode {
+  FREE_CHOICE
+  DESTINY
+}
+
+model Character {
+  id             String         @id @default(uuid()) @db.Uuid
+  landHoldings   LandHolding[]
+  plants         IndustryPlant[]
+  accountId      String         @unique @db.Uuid
+  account        Account        @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name           String         @db.VarChar(32)
+  profile        ProfileType
+  region         Region
+  birthCondition BirthCondition
+  birthMode      BirthMode
+  /**
+   * Apparence choisie dans l'éditeur (indices validés par LookDto), null = tirée de l'identifiant.
+   */
+  look           Json?
+  housing        String         @db.VarChar(32)
+  /**
+   * Propriétaire de son logement : plus de loyer à payer.
+   */
+  homeOwned      Boolean        @default(false)
+  /**
+   * Logement construit sur un terrain du lotissement : position propre sur la carte.
+   */
+  homeX          Int?
+  homeZ          Int?
+
+  // Besoins 0..100 (contrainte CHECK en base)
+  hunger         Int      @default(80)
+  energy         Int      @default(80)
+  hygiene        Int      @default(80)
+  health         Int      @default(90)
+  morale         Int      @default(70)
+  respect        Int      @default(10)
+  needsUpdatedAt DateTime @default(now())
+
+  jobId                 String?   @db.VarChar(32)
+  /// Métiers occupés en même temps (au plus `work.maxJobs`) ; `jobId` est celui qui est actif.
+  jobIds                String[]  @default([]) @db.VarChar(32)
+  job                   Job?      @relation(fields: [jobId], references: [id])
+  lastWorkedAt          DateTime?
+  /// Nuit de sommeil en cours (début et réveil prévu) : le personnage ne peut rien faire d'autre.
+  sleepStartedAt        DateTime?
+  /// Pris en charge par le SAMU à l'hôpital jusqu'à cette date : aucune action possible ; à la sortie, besoins remontés et facture.
+  hospitalUntil         DateTime?
+  hospitalStartedAt     DateTime?
+  sleepUntil            DateTime?
+  /// Dernière séance par métier { idMétier: date ISO } : le délai d'un métier n'empêche pas d'en exercer un autre.
+  jobWorkedAt           Json      @default("{}")
+  /// Contrat de moto confiée par un propriétaire (zém) : date de signature, null = aucun contrat. Un versement fixe est prélevé à chaque séance.
+  zemContractAt         DateTime?
+  lastRestAt            DateTime?
+  lastMusicAt           DateTime?
+  /// Dernière séance par loisir à la maison { tv: date ISO, read: date ISO }
+  leisureAt             Json      @default("{}")
+  // Assurance maladie universelle : couvert jusqu'à ce jour de jeu (salaire cotisé, déclaration TNS ou adhésion volontaire)
+  amuPaidUntilGameDay   Int       @default(0)
+  rentPaidUntilGameDay  Int       @default(0)
+  // Loyer : dette laissée après une expulsion, caution versée au propriétaire, sans logement, dernier rappel (jour de jeu ; -1 = partie antérieure aux règles de retard)
+  rentDebt              BigInt    @default(0)
+  rentDeposit           BigInt    @default(0)
+  homeless              Boolean   @default(false)
+  rentNagDay            Int       @default(-1)
+  // Factures du logement : électricité (CEET), eau (TdE), wifi (abonnement facultatif, 0 = aucun)
+  elecPaidUntilGameDay  Int       @default(0)
+  waterPaidUntilGameDay Int       @default(0)
+  /// Douches prises depuis la dernière facture d'eau : facturées en fin de mois avec l'abonnement (tarif `action.wash.price`).
+  waterShowers          Int       @default(0)
+  /// Compteur d'électricité depuis la dernière facture : kWh des cuissons au réchaud électrique.
+  elecKwhUsed           Int       @default(0)
+  /// Compteur d'eau depuis la dernière facture : litres utilisés pour la cuisine (les douches ont leur propre compteur).
+  waterLitresUsed       Int       @default(0)
+  wifiPaidUntilGameDay  Int       @default(0)
+  // Lieu où se trouve le personnage : identifiant d'un lieu (venue) ou « home ».
+  locationId            String    @default("home") @db.VarChar(32)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  wallet          Wallet?
+  companies       Company[]
+  /**
+   * Entreprise sélectionnée parmi plusieurs (null = la plus ancienne ouverte).
+   */
+  activeCompanyId String?        @db.Uuid
+  homeItems       HomeItem[]
+  /**
+   * Types de logement dont les meubles d'origine ont déjà été donnés au joueur (liste séparée par des virgules).
+   */
+  homeSeeded      String         @default("") @db.VarChar(120)
+  employments     Employee[]
+  /// Tours de tontine non payés (réputation visible des autres joueurs avant de l'accepter).
+  tontineDefaults Int                @default(0)
+  tontineMembers  TontineMember[]
+  stall           Stall?
+  inventory       InventoryItem[]
+  hasFreezer      Boolean            @default(false)
+  freezer         FreezerItem[]
+  appliances      KitchenAppliance[]
+  diplomas        Diploma[]
+  study           Study?
+  garments        Garment[]
+  clothingShop    ClothingShop?
+  pantry          PantryLot[]
+
+  /// Ville où se trouve le personnage ; voyage en car entre villes jusqu'à `tripUntil` (aucune autre action pendant le trajet).
+  city      String    @default("lome") @db.VarChar(16)
+  tripUntil DateTime?
+  /// Départ du voyage en cours (ville et heure), pour montrer le car sur la route
+  tripFrom  String?   @db.VarChar(16)
+  tripStart DateTime?
+
+  // Vie quotidienne : jours de jeu déjà traités (maladie, famille, coupures)
+  lifeCheckedDay   Int              @default(-1)
+  /// Maladie en cours (identifiant du réglage health.illnesses), jour d'apparition, diagnostic posé à l'hôpital
+  illnessId        String?          @db.VarChar(32)
+  illnessDay       Int?
+  diagnosed        Boolean          @default(false)
+  /// Coupure d'électricité ou d'eau au logement jusqu'à cette date réelle
+  powerCutUntil    DateTime?
+  waterCutUntil    DateTime?
+  /// Équipement contre les coupures : groupe électrogène, panneau solaire, citerne
+  generator        Boolean          @default(false)
+  solar            Boolean          @default(false)
+  waterTank        Boolean          @default(false)
+  familyRequests   FamilyRequest[]
+  medicalVisits    MedicalVisit[]
+  medicalBills     MedicalBill[]
+  vehicles         OwnedVehicle[]
+  ceremoniesHosted Ceremony[]
+  ceremonyGuests   CeremonyGuest[]
+  /// Chat interdit jusqu'à cette date (sanction de modération).
+  mutedUntil       DateTime?
+  chatMessages     ChatMessage[]
+  groupsOwned      ChatGroup[]      @relation("groupOwner")
+  groupMemberships ChatGroupMember[]
+  reportsMade      Report[]         @relation("reporter")
+  reportsAbout     Report[]         @relation("reported")
+  enrollments      Enrollment[]
+  conferenceSeats  ConferenceSeat[]
+  hotelStays       HotelStay[]
+  hallBookings     HallBooking[]
+
+  @@map("character")
+}
+
+// ───────────── Argent : portefeuilles et grand livre ─────────────
+
+model Wallet {
+  id          String     @id @default(uuid()) @db.Uuid
+  characterId String?    @unique @db.Uuid
+  character   Character? @relation(fields: [characterId], references: [id], onDelete: Restrict)
+  systemCode  String?    @unique @db.VarChar(32) // TREASURY, MARKET, FEES, LANDLORD, PURCHASES, BANK
+  currency    String     @default("XOF") @db.VarChar(3)
+  balance     BigInt     @default(0) // CHECK (balance >= 0) pour les portefeuilles joueurs
+  /// Portefeuille d'une vie terminée (« recommencer ») : sans propriétaire, solde figé à 0 (CHECK), historique conservé.
+  archivedAt  DateTime?
+  createdAt   DateTime   @default(now())
+
+  entries LedgerEntry[]
+
+  @@map("wallet")
+}
+
+model LedgerTransaction {
+  id             String        @id @default(uuid()) @db.Uuid
+  kind           String        @db.VarChar(32)
+  idempotencyKey String?       @unique @db.VarChar(128)
+  requestHash    String?       @db.VarChar(64) // empreinte de la requête : une clé ne peut pas servir à autre chose
+  memo           String?       @db.VarChar(140)
+  createdAt      DateTime      @default(now())
+  entries        LedgerEntry[]
+
+  @@index([createdAt])
+  @@map("ledger_transaction")
+}
+
+model LedgerEntry {
+  id            String            @id @default(uuid()) @db.Uuid
+  transactionId String            @db.Uuid
+  transaction   LedgerTransaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  walletId      String            @db.Uuid
+  wallet        Wallet            @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  amount        BigInt // > 0 crédit, < 0 débit
+  balanceAfter  BigInt
+  createdAt     DateTime          @default(now())
+
+  @@index([walletId, createdAt])
+  @@index([transactionId])
+  @@map("ledger_entry")
+}
+
+// ───────────── Règles du jeu modifiables sans redéployer ─────────────
+
+model GameSetting {
+  key       String   @id @db.VarChar(64)
+  value     Json
+  updatedAt DateTime @updatedAt
+  updatedBy String?  @db.Uuid
+
+  @@map("game_setting")
+}
+
+model Job {
+  id             String  @id @db.VarChar(32)
+  level          String  @db.VarChar(16) // DEBROUILLE, QUALIFIE, DIPLOME, ENTREPRENEUR
+  nameFr         String  @db.VarChar(64)
+  nameEn         String  @db.VarChar(64)
+  payPerShift    Int
+  energyCost     Int
+  hungerCost     Int
+  hygieneCost    Int     @default(0)
+  shiftGameHours Int
+  riskPercent    Int     @default(0) // risque d'incident (accident de zém…)
+  category       String  @default("services") @db.VarChar(24) // famille de métiers (filtre de l'appli Travail)
+  emoji          String  @default("💼") @db.VarChar(8)
+  descFr         String  @default("") @db.VarChar(280)
+  descEn         String  @default("") @db.VarChar(280)
+  enabled        Boolean @default(true)
+
+  characters Character[]
+
+  @@map("job")
+}
+
+model FoodItem {
+  id      String  @id @db.VarChar(32)
+  nameFr  String  @db.VarChar(64)
+  nameEn  String  @db.VarChar(64)
+  price   Int
+  hunger  Int
+  energy  Int     @default(0)
+  morale  Int     @default(0)
+  health  Int     @default(0)
+  enabled Boolean @default(true)
+
+  @@map("food_item")
+}
+
+// ───────────── Entreprise : parcours CFE → RCCM/NIF → CNSS → déclarations ─────────────
+
+enum CompanyForm {
+  EI
+  SARL
+  SA
+}
+
+enum CompanyStatus {
+  PENDING_CFE // dossier déposé, en traitement au CFE
+  REGISTERED // documents retirés : RCCM, NIF, carte d'opérateur économique
+  CLOSED
+}
+
+model Company {
+  id                String        @id @default(uuid()) @db.Uuid
+  characterId       String        @db.Uuid
+  character         Character     @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  name              String        @db.VarChar(48)
+  activityId        String        @db.VarChar(32)
+  form              CompanyForm
+  status            CompanyStatus @default(PENDING_CFE)
+  /**
+   * Documents disponibles au guichet à partir de cette date réelle (délai CFE en heures de jeu).
+   */
+  readyAt           DateTime
+  rccm              String?       @unique @db.VarChar(40)
+  nif               String?       @unique @db.VarChar(20)
+  cnssNumber        String?       @unique @db.VarChar(20)
+  lastWorkedAt      DateTime?
+  /**
+   * Mois de jeu (index) de la dernière déclaration payée ; -1 = aucune.
+   */
+  lastDeclaredMonth Int           @default(-1)
+  /**
+   * Mois de jeu de création : premier mois à déclarer.
+   */
+  createdMonth      Int
+  /**
+   * Chiffre d'affaires encaissé depuis la dernière déclaration, en FCFA (BigInt).
+   */
+  pendingRevenue    BigInt        @default(0)
+  /// Chiffre d'affaires des usines et sites de l'entreprise depuis la dernière déclaration (impôt OTR seulement).
+  pendingPlantRevenue BigInt      @default(0)
+  createdAt         DateTime      @default(now())
+  plants            IndustryPlant[]
+  /**
+   * Fermeture ou vente (status CLOSED).
+   */
+  closedAt          DateTime?
+  /**
+   * Dernière vente automatique des salariés (heure réelle).
+   */
+  lastAutoSaleAt    DateTime?
+  employees         Employee[]
+  offers            JobOffer[]
+  tenderApplications TenderApplication[]
+
+  @@index([characterId])
+  @@map("company")
+}
+
+/**
+ * Salarié : personnage non joueur (candidat du jour) ou joueur ayant accepté une offre (characterId).
+ */
+model Employee {
+  id            String     @id @default(uuid()) @db.Uuid
+  /**
+   * Entreprise d'un joueur ; vide pour un emploi chez un employeur public (voir publicJobId).
+   */
+  companyId     String?    @db.Uuid
+  company       Company?   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  /**
+   * Métier du catalogue pour un emploi salarié public (salaire versé par le Trésor selon l'assiduité).
+   */
+  publicJobId   String?    @db.VarChar(32)
+  /**
+   * Site industriel (usine, zone franche, ferme, élevage) d'un joueur : le salarié y travaille, le propriétaire le paie.
+   */
+  plantId       String?    @db.Uuid
+  plant         IndustryPlant? @relation(fields: [plantId], references: [id], onDelete: Cascade)
+  name          String     @db.VarChar(48)
+  roleFr        String     @db.VarChar(48)
+  roleEn        String     @db.VarChar(48)
+  /**
+   * Salaire brut mensuel (FCFA), jamais sous le SMIG.
+   */
+  grossMonthly  Int
+  hiredDay      Int
+  /**
+   * Immatriculation CNSS : obligatoire dans les 8 jours suivant l'embauche.
+   */
+  cnssNumber    String?    @unique @db.VarChar(20)
+  /**
+   * Dernier mois de jeu payé ; le mois d'embauche est le premier dû.
+   */
+  lastPaidMonth Int        @default(-1)
+  hiredMonth    Int
+  active        Boolean    @default(true)
+  /**
+   * Salarié joueur : son personnage reçoit le net de la paie sur son portefeuille.
+   */
+  characterId   String?    @db.Uuid
+  character     Character? @relation(fields: [characterId], references: [id], onDelete: SetNull)
+  createdAt     DateTime   @default(now())
+
+  @@index([companyId])
+  @@index([characterId])
+  @@map("employee")
+}
+
+/**
+ * Offre d'emploi publiée par un joueur patron, acceptée par un autre joueur.
+ */
+model JobOffer {
+  id           String   @id @default(uuid()) @db.Uuid
+  companyId    String   @db.Uuid
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  roleFr       String   @db.VarChar(48)
+  roleEn       String   @db.VarChar(48)
+  /**
+   * Salaire brut mensuel (FCFA), entre le SMIG et le plafond du réglage company.playerJobs.
+   */
+  grossMonthly Int
+  open         Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  @@index([open, createdAt])
+  @@index([companyId])
+  @@map("job_offer")
+}
+
+// ───────────── Marchés publics (tenders) ─────────────
+
+enum TenderStatus {
+  OPEN // candidatures ouvertes
+  AWARDED // candidatures closes, places attribuées (exécution en cours ou terminée)
+  CANCELLED // annulé avant attribution : personne n'est payé
+}
+
+enum TenderApplicationStatus {
+  PENDING // en attente de la clôture des candidatures
+  SELECTED // retenue : travail en cours (sessionsCompleted < tender.requiredSessions)
+  REJECTED // non retenue
+  PAID // travail terminé (sessionsCompleted = tender.requiredSessions) et proposedPrice payé
+}
+
+/**
+ * Marché public : publié par le jeu (cadence réglable) ou par un admin, ciblant un secteur d'entreprise
+ * (mêmes identifiants que `company.activities`). Les entreprises REGISTERED de ce secteur candidatent avant
+ * la date limite avec un prix ET un délai de leur choix ; les meilleures candidatures (score prix+délai) sont
+ * retenues à cette date. `maxBudget` est un PLAFOND annoncé (pas un montant fixe) ; le montant réellement payé
+ * au gagnant est celui qu'il a lui-même proposé (`TenderApplication.proposedPrice`). `requiredSessions` est le
+ * nombre de séances de travail nécessaires pour réaliser le projet : fixé indépendamment du prix/délai proposés
+ * par les candidats, donc connu de tous avant même de candidater (résout l'œuf-et-la-poule prix/durée/coût).
+ */
+model PublicTender {
+  id                   String        @id @default(uuid()) @db.Uuid
+  sector               String        @db.VarChar(32)
+  /**
+   * Autres domaines couverts par le même marché (une offre peut englober plusieurs domaines) : toute entreprise d'un de ces
+   * domaines, ou du domaine principal, peut candidater.
+   */
+  sectors              String[]      @default([])
+  /**
+   * Contenu réel du marché (pas qu'un code de secteur) : titre et description bilingues, piochés dans un
+   * catalogue déterministe (génération auto) ou saisis par un admin (création manuelle).
+   */
+  titleFr              String        @db.VarChar(160)
+  titleEn              String        @db.VarChar(160)
+  descriptionFr        String        @db.VarChar(600)
+  descriptionEn        String        @db.VarChar(600)
+  slots                Int
+  /**
+   * Budget PLAFOND annoncé par place (FCFA, BigInt) : une candidature proposant plus est refusée. Le montant
+   * réellement payé est celui proposé par le candidat retenu (`TenderApplication.proposedPrice`), jamais ce plafond.
+   */
+  maxBudget            BigInt
+  /**
+   * Durée d'exécution maximale autorisée (heures de jeu) : une candidature proposant plus est refusée.
+   */
+  maxHours             Int
+  /**
+   * Nombre de séances de travail nécessaires pour réaliser le projet, fixé à la création (admin) ou tiré
+   * aléatoirement dans `market.tenders.sessionsRange` (génération auto). Coût de réalisation =
+   * `requiredSessions × company.activities[sector].cost` (calcul pur dans `economy/tenders.ts`).
+   */
+  requiredSessions     Int
+  status               TenderStatus  @default(OPEN)
+  applicationDeadlineAt DateTime
+  createdByAdminId     String?       @db.Uuid
+  /**
+   * Clé d'idempotence d'une création manuelle (admin) : rejoue la même création sans en créer une seconde.
+   */
+  idempotencyKey       String?       @unique @db.VarChar(128)
+  createdAt            DateTime      @default(now())
+  applications         TenderApplication[]
+
+  @@index([status, applicationDeadlineAt])
+  @@map("public_tender")
+}
+
+/**
+ * Candidature d'une entreprise à un marché public (une par entreprise et par marché).
+ * `proposedPrice` (≤ `tender.maxBudget`) et `proposedHours` (≥ minimum physique dérivé de `requiredSessions`,
+ * ≤ `tender.maxHours`) sont choisis par le candidat. `score` : dérivé du prix et du délai proposés (pondération
+ * `market.tenders.scoreWeightsBp`), calculé à la clôture ; conservée pour l'audit, jamais recalculée après coup.
+ * `sessionsCompleted` avance à chaque appel réussi de `POST /tenders/applications/:id/advance` (vraie séance de
+ * travail, débit du coût réel) ; une fois égal à `tender.requiredSessions`, le paiement de `proposedPrice` se
+ * déclenche dans la même transaction que ce dernier débit, et le statut passe à PAID.
+ */
+model TenderApplication {
+  id                String                   @id @default(uuid()) @db.Uuid
+  tenderId          String                   @db.Uuid
+  tender            PublicTender             @relation(fields: [tenderId], references: [id], onDelete: Cascade)
+  companyId         String                   @db.Uuid
+  company           Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  /**
+   * Prix proposé par le candidat (FCFA, BigInt), ≤ `tender.maxBudget` : c'est ce montant exact qui est payé si
+   * la candidature est retenue puis menée à terme, jamais `tender.maxBudget`.
+   */
+  proposedPrice     BigInt
+  proposedHours     Int
+  status            TenderApplicationStatus  @default(PENDING)
+  score             Float                    @default(0)
+  /**
+   * Nombre de séances de travail déjà accomplies (max `tender.requiredSessions`) : progression RÉELLE du travail,
+   * pas une échéance de temps passive.
+   */
+  sessionsCompleted Int                      @default(0)
+  /**
+   * Fixées à la sélection (retenue) : échéance individuelle d'exécution (affichage « promis pour telle date »,
+   * ne déclenche plus le paiement), puis date de paiement effectif (déclenché par la fin du travail).
+   */
+  startedAt         DateTime?
+  endsAt            DateTime?
+  /**
+   * Horodatage du dernier appel réussi à `advance()` (ou `startedAt` avant le premier) : impose la cadence
+   * `company.activities[sector].shiftGameHours` entre deux séances, comme une séance de travail classique.
+   */
+  lastAdvancedAt    DateTime?
+  paidAt            DateTime?
+  createdAt         DateTime                 @default(now())
+
+  @@unique([tenderId, companyId])
+  @@index([status, endsAt])
+  @@index([companyId])
+  @@map("tender_application")
+}
+
+/**
+ * Séance de travail en missions : commandes générées par le serveur, payées une par une.
+ */
+model WorkShift {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  /**
+   * « job » (métier) ou « company » (sa propre entreprise).
+   */
+  kind        String    @db.VarChar(16)
+  sourceId    String    @db.VarChar(32)
+  /**
+   * Missions : [{ id, kind, from?, to?, item?, qty?, amount, status: open|done|declined }] — montants entiers.
+   */
+  orders      Json
+  startedAt   DateTime  @default(now())
+  endsAt      DateTime
+  closedAt    DateTime?
+
+  @@index([characterId, closedAt])
+  @@map("work_shift")
+}
+
+// ───────────── Conférences publiques ─────────────
+
+/**
+ * Place prise à une conférence (un jour de jeu) : payée à l'entrée, récompensée à la fin si l'on est resté.
+ */
+model ConferenceSeat {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  day         Int
+  topicId     String    @db.VarChar(32)
+  rewarded    Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+
+  @@unique([characterId, day])
+  @@map("conference_seat")
+}
+
+// ───────────── Études : cours du soir et apprentissages ─────────────
+
+model Enrollment {
+  id             String    @id @default(uuid()) @db.Uuid
+  characterId    String    @db.Uuid
+  character      Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  courseId       String    @db.VarChar(32)
+  sessionsDone   Int       @default(0)
+  correctAnswers Int       @default(0)
+  /**
+   * Jour de jeu de la dernière séance suivie (une séance par jour).
+   */
+  lastSessionDay Int       @default(-1)
+  /**
+   * Jour de jeu où le joueur s'est assis en classe (-1 : jamais) : la question n'est posée qu'à la fin du cours.
+   */
+  classDay       Int       @default(-1)
+  completedAt    DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@unique([characterId, courseId])
+  @@map("enrollment")
+}
+
+// ───────────── Espace partenaires : panneaux publicitaires ─────────────
+
+enum PartnerKind {
+  BRAND
+  SCHOOL
+  ARTIST
+  PROMOTER
+  INSTITUTION
+}
+
+enum CampaignStatus {
+  AWAITING_PAYMENT // réservée depuis le jeu, paiement non encore confirmé par le fournisseur
+  PENDING // soumise, en attente de validation par l'équipe
+  APPROVED
+  REJECTED
+  ENDED
+}
+
+model Partner {
+  id         String         @id @default(uuid()) @db.Uuid
+  name       String         @db.VarChar(64)
+  kind       PartnerKind
+  website    String?        @db.VarChar(200) // https uniquement (vérifié côté serveur)
+  contact    String?        @db.VarChar(120)
+  /**
+   * Compte du jeu qui gère ce partenaire (réservation en libre-service), facultatif.
+   */
+  accountId  String?        @db.Uuid
+  active     Boolean        @default(true)
+  createdAt  DateTime       @default(now())
+  /**
+   * Formule commerciale (contrat signé hors jeu, attribuée par l'équipe) et sa fin.
+   */
+  tier       PartnerTier    @default(NONE)
+  tierEndsAt DateTime?
+  /**
+   * Lieu de marque sur la carte (formules Argent et Or).
+   */
+  placeLabel String?        @db.VarChar(40)
+  placeX     Int?
+  placeZ     Int?
+  placeColor String?        @db.VarChar(7)
+  /// Modèle du bâtiment de marque (tour, agence, restaurant, station…), choisi par l'admin.
+  placeModel String?        @db.VarChar(16)
+  /**
+   * Montré dans la section « Nos partenaires » du site (si le réglage partners.showcase l'affiche).
+   */
+  showOnSite Boolean        @default(false)
+  logo       PartnerLogo?
+  campaigns  Campaign[]
+  offers     PartnerOffer[]
+
+  @@index([accountId])
+  @@map("partner")
+}
+
+/**
+ * Affiche sur un panneau de la ville, avec lien vers le site du partenaire.
+ */
+model Campaign {
+  id         String         @id @default(uuid()) @db.Uuid
+  partnerId  String         @db.Uuid
+  partner    Partner        @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  /**
+   * Emplacement du panneau (0..N) ; -1 = tous les panneaux.
+   */
+  slot       Int
+  title      String         @db.VarChar(40)
+  subtitle   String         @db.VarChar(80)
+  bg         String         @db.VarChar(7) // couleur #rrggbb
+  fg         String         @db.VarChar(7)
+  url        String?        @db.VarChar(200)
+  startsAt   DateTime       @default(now())
+  endsAt     DateTime
+  status     CampaignStatus @default(PENDING)
+  views      Int            @default(0)
+  clicks     Int            @default(0)
+  /**
+   * Parcelles en mer (slot = -2) : coin haut-gauche et taille en cases.
+   */
+  plotX      Int?
+  plotY      Int?
+  plotW      Int?
+  plotH      Int?
+  /**
+   * Durée achetée (jours) : la diffusion commence à la validation par l'équipe.
+   */
+  days       Int            @default(7)
+  /**
+   * Achat réel qui finance la campagne (réservation depuis le jeu).
+   */
+  purchaseId String?        @unique @db.Uuid
+  createdAt  DateTime       @default(now())
+
+  @@index([status, endsAt])
+  @@map("campaign")
+}
+
+// ───────────── Monde : lieux de la ville et activités ─────────────
+
+model Venue {
+  id         String          @id @db.VarChar(32)
+  emoji      String          @db.VarChar(16)
+  nameFr     String          @db.VarChar(64)
+  nameEn     String          @db.VarChar(64)
+  districtFr String          @db.VarChar(64)
+  districtEn String          @db.VarChar(64)
+  descFr     String          @db.VarChar(400)
+  descEn     String          @db.VarChar(400)
+  /// Ville du lieu (lome, kpalime, sokode, kara, dapaong) : les coordonnées sont propres à chaque ville.
+  city       String          @default("lome") @db.VarChar(16)
+  // Position sur la carte (unités du monde 3D ; 10 unités ≈ 1 km pour les tarifs de transport)
+  x          Int
+  z          Int
+  // Appli du téléphone ouverte par le lieu (eat, work…), facultative
+  app        String?         @db.VarChar(16)
+  enabled    Boolean         @default(true)
+  activities VenueActivity[]
+
+  @@index([city])
+  @@map("venue")
+}
+
+model VenueActivity {
+  id      String  @id @db.VarChar(32)
+  venueId String  @db.VarChar(32)
+  venue   Venue   @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  emoji   String  @db.VarChar(16)
+  nameFr  String  @db.VarChar(64)
+  nameEn  String  @db.VarChar(64)
+  price   Int     @default(0)
+  hunger  Int     @default(0)
+  energy  Int     @default(0)
+  hygiene Int     @default(0)
+  health  Int     @default(0)
+  morale  Int     @default(0)
+  respect Int     @default(0)
+  sort    Int     @default(0)
+  enabled Boolean @default(true)
+
+  @@index([venueId])
+  @@map("venue_activity")
+}
+
+// ───────────── Paiements réels ─────────────
+
+enum ProductKind {
+  COINS
+  PREMIUM
+  AD_BOARD // réservation d'un panneau publicitaire (argent réel)
+  AD_PLOT // parcelles en mer (prix par parcelle, argent réel)
+}
+
+model Product {
+  id           String      @id @db.VarChar(32)
+  kind         ProductKind
+  nameFr       String      @db.VarChar(64)
+  nameEn       String      @db.VarChar(64)
+  priceAmount  Int // prix réel en FCFA, décidé par le serveur
+  currency     String      @default("XOF") @db.VarChar(3)
+  coinsGranted Int         @default(0)
+  active       Boolean     @default(true)
+
+  purchases Purchase[]
+
+  @@map("product")
+}
+
+enum PurchaseStatus {
+  PENDING
+  PAID
+  FAILED
+  CANCELLED
+}
+
+model Purchase {
+  id           String         @id @default(uuid()) @db.Uuid
+  accountId    String         @db.Uuid
+  account      Account        @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  productId    String         @db.VarChar(32)
+  product      Product        @relation(fields: [productId], references: [id])
+  amount       Int
+  currency     String         @db.VarChar(3)
+  coinsGranted Int            @default(0) // figé à la création de l'achat
+  provider     String         @db.VarChar(32)
+  providerRef  String?        @db.VarChar(128)
+  status       PurchaseStatus @default(PENDING)
+  createdAt    DateTime       @default(now())
+  paidAt       DateTime?
+
+  @@unique([provider, providerRef])
+  @@index([accountId])
+  @@map("purchase")
+}
+
+model PaymentEvent {
+  id         String   @id @default(uuid()) @db.Uuid
+  provider   String   @db.VarChar(32)
+  eventId    String   @db.VarChar(128)
+  payload    Json
+  receivedAt DateTime @default(now())
+
+  @@unique([provider, eventId])
+  @@map("payment_event")
+}
+
+// ───────────── Traçabilité ─────────────
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  actorId   String?  @db.Uuid
+  action    String   @db.VarChar(64)
+  target    String?  @db.VarChar(128)
+  meta      Json?
+  ip        String?  @db.VarChar(64)
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorId])
+  @@map("audit_log")
+}
+
+enum PartnerTier {
+  NONE
+  BRONZE
+  SILVER
+  GOLD
+}
+
+enum OfferKind {
+  JOB
+  EVENT
+}
+
+/**
+ * Offre réelle d'un partenaire : emploi ou événement, lien sortant https.
+ */
+model PartnerOffer {
+  id        String    @id @default(uuid()) @db.Uuid
+  partnerId String    @db.Uuid
+  partner   Partner   @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  kind      OfferKind
+  title     String    @db.VarChar(80)
+  body      String    @db.VarChar(400)
+  place     String    @db.VarChar(80)
+  url       String?   @db.VarChar(200)
+  /**
+   * Date de l'événement (événements uniquement).
+   */
+  happensAt DateTime?
+  endsAt    DateTime
+  active    Boolean   @default(true)
+  views     Int       @default(0)
+  clicks    Int       @default(0)
+  createdAt DateTime  @default(now())
+
+  @@index([kind, active, endsAt])
+  @@map("partner_offer")
+}
+
+/**
+ * Stock de marchandises d'un personnage (commerce import / export au port).
+ */
+model Holding {
+  characterId String   @db.Uuid
+  goodId      String   @db.VarChar(32)
+  qty         Int
+  /**
+   * Coût d'achat total du stock restant (FCFA), pour afficher le prix de revient.
+   */
+  cost        BigInt   @default(0)
+  updatedAt   DateTime @updatedAt
+
+  @@id([characterId, goodId])
+  @@map("holding")
+}
+
+/**
+ * OBSOLÈTE : le lotissement est devenu la zone « lotissement » du foncier (migration 20261024200000_estate_into_land).
+ * Les lignes sont conservées mais plus lues ; la table pourra être supprimée plus tard.
+ */
+model EstatePlot {
+  index        Int       @id
+  characterId  String    @unique @db.Uuid
+  boughtAt     DateTime  @default(now())
+  /**
+   * Modèle commandé (type de logement) et fin du chantier.
+   */
+  model        String?   @db.VarChar(32)
+  buildReadyAt DateTime?
+  movedIn      Boolean   @default(false)
+
+  @@map("estate_plot")
+}
+
+/**
+ * Actions détenues (bourse simulée du jeu).
+ */
+model StockHolding {
+  characterId String   @db.Uuid
+  symbol      String   @db.VarChar(8)
+  qty         Int
+  cost        BigInt   @default(0)
+  updatedAt   DateTime @updatedAt
+
+  @@id([characterId, symbol])
+  @@map("stock_holding")
+}
+
+/**
+ * Placement : saison agricole (paiement à la récolte) ou seconde activité (revenu quotidien).
+ */
+model Venture {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  optionId    String    @db.VarChar(32)
+  kind        String    @db.VarChar(12)
+  invested    BigInt
+  /**
+   * Total rapporté, tiré par le serveur au lancement (caché au joueur jusqu'au bout).
+   */
+  payout      BigInt
+  totalDays   Int
+  /**
+   * Jours actifs avant un échec éventuel (= totalDays si tout va bien).
+   */
+  activeDays  Int
+  collected   BigInt    @default(0)
+  startedAt   DateTime  @default(now())
+  closedAt    DateTime?
+
+  @@index([characterId, closedAt])
+  @@map("venture")
+}
+
+/**
+ * Compte épargne : les fonds sont tenus par le portefeuille système BANK ; intérêts quotidiens.
+ */
+/// Banque : livret d'épargne (un par banque, solde à jour des intérêts) ou dépôt à terme (DAT).
+/// Les fonds sont détenus par le portefeuille système BANK ; les intérêts viennent du Trésor.
+model BankDeposit {
+  id             String      @id @default(uuid()) @db.Uuid
+  characterId    String      @db.Uuid
+  bankId         String      @db.VarChar(16)
+  kind           DepositKind
+  /// Livret : solde courant ; DAT : capital placé.
+  principal      BigInt      @default(0)
+  /// Taux annuel figé à l'ouverture (points de base).
+  yearBp         Int
+  startDay       Int
+  /// Durée du DAT en jours de jeu (null pour un livret).
+  termDays       Int?
+  lastAccruedDay Int
+  closedAt       DateTime?
+  createdAt      DateTime    @default(now())
+
+  @@index([characterId, closedAt])
+  @@map("bank_deposit")
+}
+
+enum DepositKind {
+  SAVINGS
+  TERM
+}
+
+/// Prêt bancaire personnel : emprunteur = le personnage (pas l'entreprise). Un seul prêt actif (OPEN/LATE) à la
+/// fois par personnage. Octroi immédiat (BANK → joueur) ; mensualités fixes prélevées automatiquement à échéance
+/// (joueur → BANK) ; remboursement anticipé libre à tout moment. Capital emprunté dissocié du capital restant dû
+/// (qui inclut les intérêts simples répartis en mensualités) pour l'historique.
+model Loan {
+  id                String     @id @default(uuid()) @db.Uuid
+  characterId       String     @db.Uuid
+  /// Montant emprunté, crédité au joueur à l'octroi.
+  principal         BigInt
+  /// Taux annuel figé à l'octroi (points de base).
+  rateBp            Int
+  /// Durée totale du prêt en jours de jeu, figée à l'octroi.
+  termDays          Int
+  /// Nombre de mensualités, figé à l'octroi.
+  installmentsCount Int
+  /// Mensualité fixe (capital + intérêts répartis) ; le dernier versement est le solde restant s'il est plus petit.
+  installmentAmount BigInt
+  /// Capital + intérêts restant à rembourser (diminue à chaque versement, jamais négatif).
+  remaining         BigInt
+  /// Jour de jeu de la prochaine échéance (prélèvement automatique).
+  nextDueGameDay    Int
+  /// Jour de jeu où le retard a commencé (null = à jour) ; sert à calculer la pénalité cumulée.
+  lateSinceGameDay  Int?
+  /// Pénalités de retard déjà prélevées (pour l'historique, ne réduisent pas `remaining`).
+  totalPenaltyPaid  BigInt     @default(0)
+  status            LoanStatus @default(OPEN)
+  createdGameDay    Int
+  createdAt         DateTime   @default(now())
+  closedAt          DateTime?
+
+  @@index([characterId, status])
+  @@map("loan")
+}
+
+enum LoanStatus {
+  OPEN
+  LATE
+  CLOSED
+}
+
+model SavingsAccount {
+  characterId    String   @id @db.Uuid
+  balance        BigInt   @default(0)
+  /**
+   * Dernier jour de jeu pour lequel les intérêts ont été versés.
+   */
+  lastAccruedDay Int
+  updatedAt      DateTime @updatedAt
+
+  @@map("savings_account")
+}
+
+/**
+ * Image d'une annonce (parcelles en mer) : octets validés côté serveur, affichée seulement après validation.
+ */
+/// Logo d'un partenaire (facultatif) : affiché sur son bâtiment de marque et dans sa fiche. Image réencodée côté client, vérifiée côté serveur.
+model PartnerLogo {
+  partnerId String   @id @db.Uuid
+  partner   Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  mime      String   @db.VarChar(16)
+  width     Int
+  height    Int
+  data      Bytes
+  updatedAt DateTime @updatedAt
+
+  @@map("partner_logo")
+}
+
+model CampaignImage {
+  campaignId String   @id @db.Uuid
+  mime       String   @db.VarChar(16)
+  width      Int
+  height     Int
+  data       Bytes
+  createdAt  DateTime @default(now())
+
+  @@map("campaign_image")
+}
+
+// ───────────── Temps réel : chat et modération ─────────────
+
+/**
+ * Message de chat : salon de la ville (« city:lome ») ou du lieu où se trouve le joueur (« place:<id> »).
+ */
+model ChatMessage {
+  id          String    @id @default(uuid()) @db.Uuid
+  room        String    @db.VarChar(48)
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  text        String    @db.VarChar(280)
+  /// Masqué par la modération ou par les signalements : n'est plus diffusé.
+  hidden      Boolean   @default(false)
+  /// Message auquel celui-ci répond (même salon), ou null.
+  replyToId   String?   @db.Uuid
+  /// Trace d'un envoi d'argent dans une conversation privée (FCFA), posée par le serveur seul ; le texte est alors vide.
+  moneyAmount BigInt?
+  createdAt   DateTime  @default(now())
+  reports     Report[]
+
+  @@index([room, createdAt])
+  @@index([characterId, createdAt])
+  @@map("chat_message")
+}
+
+/**
+ * Groupe de discussion privé (salon « group:<id> ») : créé par un joueur, qui en reste le propriétaire (ajoute et retire des membres).
+ */
+model ChatGroup {
+  id        String            @id @default(uuid()) @db.Uuid
+  name      String            @db.VarChar(40)
+  ownerId   String            @db.Uuid
+  owner     Character         @relation("groupOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt DateTime          @default(now())
+  members   ChatGroupMember[]
+
+  @@map("chat_group")
+}
+
+model ChatGroupMember {
+  groupId     String    @db.Uuid
+  group       ChatGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  joinedAt    DateTime  @default(now())
+
+  @@id([groupId, characterId])
+  @@index([characterId])
+  @@map("chat_group_member")
+}
+
+enum ReportStatus {
+  OPEN
+  DISMISSED
+  ACTIONED
+}
+
+/**
+ * Signalement d'un joueur (et éventuellement d'un message) : arnaque, vente d'argent réel, insulte…
+ */
+model Report {
+  id         String       @id @default(uuid()) @db.Uuid
+  reporterId String       @db.Uuid
+  reporter   Character    @relation("reporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  targetId   String       @db.Uuid
+  target     Character    @relation("reported", fields: [targetId], references: [id], onDelete: Cascade)
+  messageId  String?      @db.Uuid
+  message    ChatMessage? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  reason     String       @db.VarChar(24)
+  status     ReportStatus @default(OPEN)
+  createdAt  DateTime     @default(now())
+  resolvedAt DateTime?
+  resolvedBy String?      @db.Uuid
+
+  @@unique([reporterId, messageId])
+  @@index([status, createdAt])
+  @@index([targetId])
+  @@map("report")
+}
+
+// ───────────── Tontine : épargne collective entre joueurs ─────────────
+
+enum TontineStatus {
+  FORMING // inscriptions ouvertes
+  ACTIVE // tours en cours
+  FINISHED
+  CANCELLED
+}
+
+/**
+ * Tontine : chaque tour, chaque membre cotise le même montant ; un membre (ordre tiré au sort au démarrage) ramasse la caisse.
+ * L'argent cotisé est séquestré dans le portefeuille système TONTINE ; les contributions et les versements de cette table
+ * servent de sous-compte : jamais plus versé que cotisé pour un tour.
+ */
+model Tontine {
+  id            String                @id @default(uuid()) @db.Uuid
+  name          String                @db.VarChar(40)
+  ownerId       String                @db.Uuid
+  /// Cotisation par tour (FCFA).
+  contribution  BigInt
+  /// Durée d'un tour en jours de jeu.
+  periodDays    Int
+  maxMembers    Int
+  status        TontineStatus         @default(FORMING)
+  /// Jour de jeu du démarrage (tour 0).
+  startDay      Int?
+  /// Prochain tour à verser.
+  nextPayout    Int                   @default(0)
+  createdAt     DateTime              @default(now())
+  members       TontineMember[]
+  contributions TontineContribution[]
+  payouts       TontinePayout[]
+
+  @@index([status, createdAt])
+  @@map("tontine")
+}
+
+model TontineMember {
+  id            String                @id @default(uuid()) @db.Uuid
+  tontineId     String                @db.Uuid
+  tontine       Tontine               @relation(fields: [tontineId], references: [id], onDelete: Cascade)
+  /// null : le joueur a quitté le jeu (« recommencer ») ; ses cotisations restent dans le sous-compte.
+  characterId   String?               @db.Uuid
+  character     Character?            @relation(fields: [characterId], references: [id], onDelete: SetNull)
+  /// Nom au moment de l'inscription (affiché même après le départ du joueur).
+  name          String                @db.VarChar(32)
+  /// Rang de ramassage (0 = premier), fixé au démarrage.
+  turn          Int?
+  /// Tours manqués dans cette tontine.
+  missed        Int                   @default(0)
+  joinedAt      DateTime              @default(now())
+  contributions TontineContribution[]
+
+  @@unique([tontineId, characterId])
+  @@index([characterId])
+  @@map("tontine_member")
+}
+
+model TontineContribution {
+  id        String        @id @default(uuid()) @db.Uuid
+  tontineId String        @db.Uuid
+  tontine   Tontine       @relation(fields: [tontineId], references: [id], onDelete: Cascade)
+  memberId  String        @db.Uuid
+  member    TontineMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  round     Int
+  amount    BigInt
+  createdAt DateTime      @default(now())
+
+  @@unique([memberId, round])
+  @@index([tontineId, round])
+  @@map("tontine_contribution")
+}
+
+model TontinePayout {
+  id            String   @id @default(uuid()) @db.Uuid
+  tontineId     String   @db.Uuid
+  tontine       Tontine  @relation(fields: [tontineId], references: [id], onDelete: Cascade)
+  round         Int
+  /// Bénéficiaire (null : caisse rendue aux cotisants, bénéficiaire défaillant ou parti).
+  beneficiaryId String?  @db.Uuid
+  amount        BigInt
+  refunded      Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  @@unique([tontineId, round])
+  @@map("tontine_payout")
+}
+
+// ───────────── Marché entre joueurs ─────────────
+
+/**
+ * Étal loué par un joueur dans un marché (un seul par joueur) : il achète en gros, fixe ses prix, vend aux autres joueurs.
+ */
+model Stall {
+  id           String      @id @default(uuid()) @db.Uuid
+  characterId  String      @unique @db.Uuid
+  character    Character   @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  venueId      String      @db.VarChar(32)
+  /// Loyer de l'étal payé jusqu'à ce jour de jeu (exclu).
+  paidUntilDay Int
+  /// Ventes cumulées à d'autres joueurs (FCFA) : rang de revendeuse jusqu'à Nana Benz.
+  sales        BigInt      @default(0)
+  createdAt    DateTime    @default(now())
+  items        StallItem[]
+
+  @@index([venueId, paidUntilDay])
+  @@map("stall")
+}
+
+model StallItem {
+  id      String @id @default(uuid()) @db.Uuid
+  stallId String @db.Uuid
+  stall   Stall  @relation(fields: [stallId], references: [id], onDelete: Cascade)
+  goodId  String @db.VarChar(32)
+  qty     Int
+  /// Prix unitaire fixé par le vendeur (FCFA), borné par le réglage market.goods.
+  price   Int
+
+  @@unique([stallId, goodId])
+  @@map("stall_item")
+}
+
+/**
+ * Marchandises achetées par un joueur, à utiliser (manger, porter, se laver…).
+ */
+model InventoryItem {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  goodId      String    @db.VarChar(32)
+  qty         Int
+
+  @@unique([characterId, goodId])
+  @@map("inventory_item")
+}
+
+/**
+ * Congélateur du logement : portions de plats achetées en gros, à manger quand on veut.
+ */
+model FreezerItem {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  foodId      String    @db.VarChar(32)
+  qty         Int
+
+  @@unique([characterId, foodId])
+  @@map("freezer_item")
+}
+
+/**
+ * Vêtement possédé (garde-robe) : une pièce du catalogue « clothes.items », jamais en double.
+ */
+model Garment {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  itemId      String    @db.VarChar(32)
+  createdAt   DateTime  @default(now())
+
+  @@unique([characterId, itemId])
+  @@map("garment")
+}
+
+/**
+ * Boutique de vêtements louée par un joueur dans un lieu d'habillement : stock acheté en gros, prix fixés dans des bornes.
+ */
+model ClothingShop {
+  id           String             @id @default(uuid()) @db.Uuid
+  characterId  String             @unique @db.Uuid
+  character    Character          @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  venueId      String             @db.VarChar(32)
+  /// Loyer payé jusqu'à ce jour de jeu (exclu).
+  paidUntilDay Int
+  /// Ventes cumulées (FCFA).
+  sales        BigInt             @default(0)
+  /// Dernier passage des clients du quartier (ils achètent seuls dans les boutiques ouvertes).
+  lastNpcSaleAt DateTime?
+  createdAt    DateTime           @default(now())
+  items        ClothingShopItem[]
+
+  @@index([venueId, paidUntilDay])
+  @@map("clothing_shop")
+}
+
+model ClothingShopItem {
+  id     String       @id @default(uuid()) @db.Uuid
+  shopId String       @db.Uuid
+  shop   ClothingShop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  itemId String       @db.VarChar(32)
+  qty    Int
+  /// Prix unitaire fixé par le vendeur (FCFA), borné par « clothes.rules ».
+  price  Int
+
+  @@unique([shopId, itemId])
+  @@map("clothing_shop_item")
+}
+
+/**
+ * Diplôme obtenu : bac technique (série), licence, master ou doctorat, dans un domaine.
+ */
+model Diploma {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  /**
+   * BT, LICENCE, MASTER ou DOCTORAT.
+   */
+  kind        String    @db.VarChar(12)
+  domain      String    @db.VarChar(24)
+  /**
+   * Série du bac technique (g2, f3…), sinon nul.
+   */
+  series      String?   @db.VarChar(8)
+  obtainedAt  DateTime  @default(now())
+
+  @@unique([characterId, kind, domain])
+  @@map("diploma")
+}
+
+/**
+ * Études en cours : un seul cursus à la fois, année par année (inscription payée, séances, examen).
+ */
+model Study {
+  id             String    @id @default(uuid()) @db.Uuid
+  characterId    String    @unique @db.Uuid
+  character      Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  kind           String    @db.VarChar(12)
+  domain         String    @db.VarChar(24)
+  series         String?   @db.VarChar(8)
+  /**
+   * Année en cours (1 à la durée du cursus).
+   */
+  year           Int       @default(1)
+  /**
+   * Inscription de l'année payée.
+   */
+  paid           Boolean   @default(false)
+  sessionsDone   Int       @default(0)
+  correctAnswers Int       @default(0)
+  lastSessionDay Int       @default(-1)
+  createdAt      DateTime  @default(now())
+
+  @@map("study")
+}
+
+/**
+ * Équipement de cuisine acheté (réfrigérateur, réchauds) : une ligne par appareil, jamais en double.
+ */
+model KitchenAppliance {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  applianceId String    @db.VarChar(24)
+  createdAt   DateTime  @default(now())
+
+  @@unique([characterId, applianceId])
+  @@map("kitchen_appliance")
+}
+
+/**
+ * Garde-manger : ingrédients, combustibles et restes de plats, par lot (un lot = une date de péremption).
+ */
+model PantryLot {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  itemId      String    @db.VarChar(40)
+  qty         Int
+  /**
+   * Null : ne se périme pas (gaz, charbon, riz…).
+   */
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([characterId, itemId])
+  @@map("pantry_lot")
+}
+
+// ───────────── Famille et cérémonies ─────────────
+
+enum FamilyRequestStatus {
+  PENDING
+  PAID
+  REFUSED
+  EXPIRED
+}
+
+/**
+ * Demande d'argent d'un proche (cousin du village, scolarité, maladie, cérémonie de famille).
+ */
+model FamilyRequest {
+  id          String              @id @default(uuid()) @db.Uuid
+  characterId String              @db.Uuid
+  character   Character           @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  kind        String              @db.VarChar(32)
+  amount      BigInt
+  day         Int
+  expiresDay  Int
+  status      FamilyRequestStatus @default(PENDING)
+  createdAt   DateTime            @default(now())
+
+  @@index([characterId, status])
+  @@map("family_request")
+}
+
+enum CeremonyKind {
+  DOT // dot et mariage traditionnel
+  BAPTEME
+  FUNERAILLES
+  ANNIVERSAIRE
+}
+
+/**
+ * Cérémonie organisée par un joueur : l'hôte paie la fête, les invités présents sur le lieu le jour dit apportent un don.
+ */
+model Ceremony {
+  id        String          @id @default(uuid()) @db.Uuid
+  hostId    String          @db.Uuid
+  host      Character       @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  kind      CeremonyKind
+  venueId   String          @db.VarChar(32)
+  day       Int
+  cost      BigInt
+  cancelled Boolean         @default(false)
+  createdAt DateTime        @default(now())
+  guests    CeremonyGuest[]
+
+  @@index([day, cancelled])
+  @@map("ceremony")
+}
+
+model CeremonyGuest {
+  id          String    @id @default(uuid()) @db.Uuid
+  ceremonyId  String    @db.Uuid
+  ceremony    Ceremony  @relation(fields: [ceremonyId], references: [id], onDelete: Cascade)
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  gift        BigInt
+  createdAt   DateTime  @default(now())
+
+  @@unique([ceremonyId, characterId])
+  @@map("ceremony_guest")
+}
+
+// ───────────── Hôtel : chambres, service en chambre, salles ─────────────
+
+/**
+ * Séjour à l'hôtel : chambre d'une catégorie, nuits payées d'avance [fromDay, toDay[ (jours de jeu).
+ * Pendant le séjour, le client peut dormir et se reposer sur place, et commander au service en chambre.
+ */
+model HotelStay {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  venueId     String    @db.VarChar(32)
+  roomType    String    @db.VarChar(24)
+  fromDay     Int
+  toDay       Int
+  paid        BigInt
+  /// Départ anticipé : la chambre est libérée (nuits non remboursées).
+  checkedOut  Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+
+  @@index([venueId, roomType, toDay])
+  @@index([characterId, toDay])
+  @@map("hotel_stay")
+}
+
+/**
+ * Location d'une salle de l'hôtel pour un jour de jeu (réunion, fête) : une seule réservation par salle et par jour.
+ */
+model HallBooking {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  venueId     String    @db.VarChar(32)
+  hallId      String    @db.VarChar(24)
+  day         Int
+  paid        BigInt
+  /// Cérémonie organisée dans la salle (fête), le cas échéant.
+  ceremonyId  String?   @db.Uuid
+  createdAt   DateTime  @default(now())
+
+  @@unique([venueId, hallId, day])
+  @@index([characterId])
+  @@map("hall_booking")
+}
+
+/**
+ * Foncier : terrain acheté par fractions de lot (quart = 150 m²) dans une zone de la carte. Une ligne par achat dans une cellule ;
+ * ce que le joueur en fait (titre foncier, exploitation, revente) suit cette ligne. Montants en FCFA entiers (BigInt).
+ */
+model LandHolding {
+  id           String        @id @default(uuid()) @db.Uuid
+  characterId  String        @db.Uuid
+  character    Character     @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  zoneId       String        @db.VarChar(24)
+  cell         Int
+  /// Nombre de quarts de lot possédés dans la cellule (1 à 4, un quart = 150 m²).
+  quarters     Int
+  /// Prix de terrain payé à l'achat (hors frais) : base de la valeur et de la plus-value.
+  paid         BigInt
+  /// BOUGHT (convention de vente), SURVEYED (bornage fait), OPINION (avis favorable), TITLED (titre foncier).
+  status       String        @default("BOUGHT") @db.VarChar(10)
+  /// Démarche en cours : état visé et fin du délai (heures de jeu converties en temps réel).
+  stepTarget   String?       @db.VarChar(10)
+  stepReadyAt  DateTime?
+  titleNo      String?       @unique @db.VarChar(24)
+  /// Exploitation : maison (`house_*`) ou activité (`biz_*`), son coût, la fin du chantier et le déjà encaissé.
+  useId        String?       @db.VarChar(32)
+  useCost      BigInt        @default(0)
+  useReadyAt   DateTime?
+  useCollected BigInt        @default(0)
+  movedIn      Boolean       @default(false)
+  createdAt    DateTime      @default(now())
+  quarterRows  LandQuarter[]
+  listing      LandListing?
+
+  @@index([characterId])
+  @@index([zoneId, cell])
+  @@map("land_holding")
+}
+
+/// Un quart de lot vendu : la clé (zone, cellule, quart) interdit de vendre deux fois la même surface, même en concurrence.
+model LandQuarter {
+  zoneId    String      @db.VarChar(24)
+  cell      Int
+  q         Int
+  holdingId String      @db.Uuid
+  holding   LandHolding @relation(fields: [holdingId], references: [id], onDelete: Cascade)
+
+  @@id([zoneId, cell, q])
+  @@index([holdingId])
+  @@map("land_quarter")
+}
+
+/// Terrain titré mis en vente par son propriétaire à un prix demandé (FCFA).
+model LandListing {
+  holdingId String      @id @db.Uuid
+  holding   LandHolding @relation(fields: [holdingId], references: [id], onDelete: Cascade)
+  ask       BigInt
+  createdAt DateTime    @default(now())
+
+  @@map("land_listing")
+}
+
+/// Usine ou zone franche du catalogue `industry` : une ligne par exemplaire vendu. Pas de ligne = exemplaire encore détenu par l'État (à vendre au prix du catalogue).
+model IndustryPlant {
+  id          String           @id @default(uuid()) @db.Uuid
+  /// Identifiant du catalogue (réglage `industry`) et numéro d'exemplaire (0 pour un site unique).
+  catalogId   String           @db.VarChar(32)
+  unit        Int              @default(0)
+  characterId String           @db.Uuid
+  character   Character        @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  /// Entreprise immatriculée du propriétaire à laquelle appartient le site (son chiffre d'affaires est déclaré avec elle à l'OTR,
+  /// ses salariés joueurs sont ceux de l'entreprise). Vide pour un site acheté avant cette règle : à rattacher.
+  companyId   String?          @db.Uuid
+  company     Company?         @relation(fields: [companyId], references: [id])
+  /// Prix payé à l'achat (base de la valeur de revente et du rachat d'une participation).
+  paid        BigInt
+  /// Salariés en poste (0 à la capacité du site).
+  staff       Int              @default(0)
+  /// Bénéfice net accumulé non encore encaissé, et date de son dernier calcul.
+  pending     BigInt           @default(0)
+  accruedAt   DateTime         @default(now())
+  /// Fin du démarrage (construction, mise en route) : aucun intérêt avant cette date. Null = site déjà en service.
+  readyAt     DateTime?
+  /// Impôt dû à l'OTR (part du chiffre d'affaires), à déclarer et payer à l'OTR ; date du plus ancien montant impayé.
+  taxDue      BigInt           @default(0)
+  /// Stock invendu (surproduction), à sa valeur au prix normal : bradé par le propriétaire ou écoulé les jours de forte demande.
+  stockValue  BigInt           @default(0)
+  /// Équipements : forage (eau) et installation solaire (électricité).
+  borehole    Boolean          @default(false)
+  solar       Boolean          @default(false)
+  /// Dernier entretien de chaque équipement (sans entretien, il perd son efficacité).
+  boreholeServicedAt DateTime?
+  solarServicedAt    DateTime?
+  /// Jour de jeu du dernier changement d'effectif (un seul par jour).
+  staffChangedDay Int?
+  taxSince    DateTime?
+  /// Investisseur PNJ entré au capital : sa part des bénéfices (points de base) ne revient pas au propriétaire.
+  investorId  String?          @db.VarChar(32)
+  investorBp  Int              @default(0)
+  askPrice    BigInt?
+  createdAt   DateTime         @default(now())
+
+  employees   Employee[]
+  jobOffers   PlantJobOffer[]
+
+  @@unique([catalogId, unit])
+  @@index([characterId])
+  @@index([companyId])
+  @@map("industry_plant")
+}
+
+/// Offre d'emploi d'un site industriel, ouverte aux autres joueurs (appli Travail).
+model PlantJobOffer {
+  id           String        @id @default(uuid()) @db.Uuid
+  plantId      String        @db.Uuid
+  plant        IndustryPlant @relation(fields: [plantId], references: [id], onDelete: Cascade)
+  /// Poste (identifiant du réglage industry.jobs.roles) et intitulés au moment de la publication.
+  roleId       String        @db.VarChar(32)
+  roleFr       String        @db.VarChar(48)
+  roleEn       String        @db.VarChar(48)
+  /// Salaire brut mensuel (FCFA), entre le SMIG et le plafond du poste.
+  grossMonthly Int
+  open         Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+
+  @@index([open, createdAt])
+  @@index([plantId])
+  @@map("plant_job_offer")
+}
+
+// ───────────── Contact des annonceurs (formulaire du site public) ─────────────
+
+enum ContactStatus {
+  NEW // non lu
+  READ // lu, pas encore traité
+  DONE // répondu ou traité
+}
+
+/**
+ * Message envoyé depuis la page « Annonces » du site : enregistré ici et envoyé par e-mail à l'équipe.
+ */
+model ContactMessage {
+  id        String         @id @default(uuid()) @db.Uuid
+  name      String         @db.VarChar(80)
+  company   String?        @db.VarChar(80)
+  /**
+   * Numéro WhatsApp, chiffres seuls avec l'indicatif (ex. 22890000000).
+   */
+  whatsapp  String         @db.VarChar(16)
+  email     String?        @db.VarChar(120)
+  topic     String         @db.VarChar(16)
+  message   String         @db.VarChar(2000)
+  locale    String         @db.VarChar(2)
+  /**
+   * Contexte d'un bug signalé depuis le jeu (compte, lieu, écran, navigateur) ; vide pour un message du site.
+   */
+  context   String?        @db.VarChar(400)
+  status    ContactStatus  @default(NEW)
+  createdAt DateTime       @default(now())
+  replies   ContactReply[]
+
+  @@index([status, createdAt])
+  @@map("contact_message")
+}
+
+/**
+ * Réponse de l'équipe : envoyée par e-mail par le serveur, ou préparée pour WhatsApp (ouverte chez l'administrateur).
+ */
+model ContactReply {
+  id        String         @id @default(uuid()) @db.Uuid
+  messageId String         @db.Uuid
+  message   ContactMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  channel   String         @db.VarChar(8) // email | whatsapp
+  text      String         @db.VarChar(2000)
+  byId      String         @db.Uuid
+  createdAt DateTime       @default(now())
+
+  @@index([messageId])
+  @@map("contact_reply")
+}
+
+// ───────────── Comptes supprimés : archive réservée à l'administration ─────────────
+
+/**
+ * Identité d'un compte supprimé, gardée pour retrouver l'auteur d'une fraude ou d'un abus (enquête, litige de paiement),
+ * pendant `account.deletedRetention.days` jours puis effacée automatiquement ; `hold` la garde tant qu'une enquête est en cours.
+ * Le compte, lui, est anonymisé : plus de connexion, e-mail / téléphone / nom libérés pour une nouvelle inscription.
+ */
+model DeletedAccount {
+  accountId     String   @id @db.Uuid
+  username      String?  @db.VarChar(32)
+  email         String?
+  phone         String?
+  googleSub     String?  @db.VarChar(64)
+  birthDate     DateTime @db.Date
+  characterName String?  @db.VarChar(64)
+  /**
+   * Dernières adresses IP distinctes vues dans le journal d'audit (au plus 50).
+   */
+  ips           String[]
+  createdAt     DateTime
+  deletedAt     DateTime @default(now())
+  purgeAt       DateTime
+  hold          Boolean  @default(false)
+
+  @@index([purgeAt])
+  @@index([email])
+  @@index([phone])
+  @@map("deleted_account")
+}
+
+enum SpotRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/**
+ * Demande d'un emplacement VIP (espace vert réservé aux partenaires Argent et Or) : liée aux coordonnées de l'emplacement
+ * souhaité, validée ou refusée par l'administration. Un emplacement approuvé ne peut plus être demandé.
+ */
+model SpotRequest {
+  id        String            @id @default(uuid()) @db.Uuid
+  accountId String            @db.Uuid
+  /// Identifiant de l'emplacement (liste partners.spots) et ses coordonnées au moment de la demande.
+  spotId    String            @db.VarChar(32)
+  x         Int
+  z         Int
+  tier      PartnerTier
+  name      String            @db.VarChar(80)
+  company   String?           @db.VarChar(80)
+  whatsapp  String            @db.VarChar(16)
+  email     String?           @db.VarChar(120)
+  message   String            @db.VarChar(1000)
+  status    SpotRequestStatus @default(PENDING)
+  /// Partenaire créé à l'approbation.
+  partnerId String?           @db.Uuid
+  decidedAt DateTime?
+  decidedBy String?           @db.Uuid
+  createdAt DateTime          @default(now())
+
+  @@index([spotId, status])
+  @@index([status, createdAt])
+  @@map("spot_request")
+}
+
+/**
+ * Meuble posé par le joueur dans son logement (catalogue : réglage home.furniture). Position dans le repère de la pièce
+ * (mètres, centre = 0), rotation en quarts de tour. Un meuble appartient à un type de logement (studio, chambre-salon, villa).
+ */
+model HomeItem {
+  id          String    @id @default(uuid()) @db.Uuid
+  characterId String    @db.Uuid
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  housing     String    @db.VarChar(32)
+  itemId      String    @db.VarChar(32)
+  x           Float
+  z           Float
+  /**
+   * Quarts de tour (0 à 3).
+   */
+  rot         Int       @default(0)
+  /**
+   * Prix payé (FCFA) : base de la revente.
+   */
+  paid        Int
+  createdAt   DateTime  @default(now())
+
+  @@index([characterId, housing])
+  @@map("home_item")
+}

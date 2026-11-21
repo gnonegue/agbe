@@ -1,0 +1,10 @@
+{
+  "mockPay": {
+    "title": "Paiement simulé (développement)",
+    "text": "Cette page remplace l'opérateur de paiement en développement. Aucun argent réel n'est débité.",
+    "purchase": "Achat n° {{id}}",
+    "confirm": "Confirmer le paiement",
+    "cancel": "Annuler et revenir au jeu",
+    "done": "Paiement simulé confirmé."
+  }
+}

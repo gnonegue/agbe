@@ -1,0 +1,5 @@
+-- AlterTable
+ALTER TABLE "character" ADD COLUMN     "homeless" BOOLEAN NOT NULL DEFAULT false,
+ADD COLUMN     "rentDebt" BIGINT NOT NULL DEFAULT 0,
+ADD COLUMN     "rentDeposit" BIGINT NOT NULL DEFAULT 0,
+ADD COLUMN     "rentNagDay" INTEGER NOT NULL DEFAULT 0;

@@ -1,0 +1,10 @@
+{
+  "mockPay": {
+    "title": "Simulated payment (development)",
+    "text": "This page replaces the payment provider during development. No real money is charged.",
+    "purchase": "Purchase #{{id}}",
+    "confirm": "Confirm payment",
+    "cancel": "Cancel and return to the game",
+    "done": "Simulated payment confirmed."
+  }
+}

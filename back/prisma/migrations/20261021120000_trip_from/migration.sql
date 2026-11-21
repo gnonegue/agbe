@@ -1,0 +1,2 @@
+ALTER TABLE "character" ADD COLUMN "tripFrom" VARCHAR(16),
+ADD COLUMN "tripStart" TIMESTAMP(3);

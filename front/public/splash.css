@@ -1,0 +1,20 @@
+/* Écran de démarrage affiché avant le chargement du JS (CSP : pas de <style> inline, donc fichier séparé, bloquant). */
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; height: 100%; }
+body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+.splash {
+  height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .4rem;
+  color: #6b7690; background: linear-gradient(160deg, #f3fbf7 0%, #fffbea 50%, #fff3f4 100%);
+}
+.splash p { margin: .4rem 0; }
+.splash .logo { font-size: 2.8rem; font-weight: 900; letter-spacing: .12em; background: linear-gradient(90deg, #006a4e, #c89b00 50%, #d21034); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.splash .logo::before { content: ''; display: block; width: 72px; height: 72px; margin: 0 auto .6rem; border-radius: 18px; background: url(/icon.svg) center / cover; box-shadow: 0 8px 24px rgba(0, 106, 78, .35); animation: splash-beat 1.4s ease-in-out infinite; }
+.splash p:last-child::after { content: ''; display: block; width: 9rem; height: 4px; margin: .8rem auto 0; border-radius: 99px; background: linear-gradient(90deg, #006a4e, #ffce00, #d21034, #006a4e); background-size: 300% 100%; animation: splash-bar 1.6s linear infinite; }
+@keyframes splash-beat { 50% { transform: scale(1.06); } }
+@keyframes splash-bar { to { background-position: 300% 0; } }
+@media (prefers-reduced-motion: reduce) { .splash .logo::before, .splash p:last-child::after { animation: none; } }
+/* Accueil pré-rendu dans index.html ; boot.js le remplace par l'écran de démarrage pour un joueur connu.
+   Ces deux éléments n'existent que dans le HTML pré-rendu : React les remplace au premier affichage. */
+.boot-splash { display: none !important; }
+.app-boot .boot-splash { display: flex !important; }
+.app-boot #root > [data-prerendered] { display: none; }

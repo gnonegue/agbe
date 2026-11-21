@@ -1,0 +1,209 @@
+# AGBE — configuration nginx de PRODUCTION (front statique + proxy de l'API NestJS).
+# Objectif : A+ sur securityheaders.com, Mozilla Observatory et SSL Labs.
+#
+# Gabarit : l'image officielle nginx remplace ${AGBE_DOMAIN} et ${AGBE_SECURITY_CONTACT} au démarrage
+# (envsubst sur /etc/nginx/templates/*.template). Seules les variables d'environnement DÉFINIES sont
+# substituées : les variables nginx ($host, $uri…) restent intactes.
+# Prérequis : nginx >= 1.25.1 (`http2 on;`), OpenSSL >= 1.1.1 (TLS 1.3). Certificat ECDSA (défaut certbot).
+
+server_tokens off;
+
+# Limitation de débit (clé = IP réelle du client).
+# Au Togo, de nombreux abonnés mobiles partagent une IP (CGNAT) : les seuils sont larges ici,
+# la vraie protection anti-force-brute est faite par le back (par compte et par couple compte/IP).
+limit_req_zone $binary_remote_addr zone=agbe_auth:10m    rate=30r/m;   # login, register, mfa
+limit_req_zone $binary_remote_addr zone=agbe_session:10m rate=300r/m;  # refresh, logout (jeton 256 bits, rien à deviner)
+limit_req_zone $binary_remote_addr zone=agbe_api:10m     rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=agbe_conn:10m;
+limit_req_status 429;
+limit_conn_status 429;
+
+upstream agbe_back {
+    server 127.0.0.1:3000;
+    keepalive 32;
+}
+
+map $uri $agbe_cache_control {
+    default                         "no-cache";
+    ~^/assets/                      "public, max-age=31536000, immutable";
+    ~^/(sw\.js|registerSW\.js|workbox-[^/]+\.js|manifest\.webmanifest)$ "no-cache, no-store, must-revalidate";
+    /index.html                     "no-cache, no-store, must-revalidate";
+    /version.json                   "no-cache, no-store, must-revalidate";
+}
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+# Hôte inconnu : connexion fermée (pas de redirection qui réfléchirait l'en-tête Host).
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${AGBE_DOMAIN};
+
+    # Défi ACME (renouvellement certbot --webroot, dossier monté depuis l'hôte).
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type "text/plain";
+    }
+    location / {
+        return 301 https://${AGBE_DOMAIN}$request_uri;
+    }
+}
+
+# HTTPS avec un nom d'hôte inconnu : poignée de main refusée.
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    http2 on;
+    server_name _;
+    ssl_reject_handshake on;
+}
+
+# ---------------------------------------------------------------------------
+# HTTPS
+# ---------------------------------------------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${AGBE_DOMAIN};
+
+    root /var/www/agbe;
+    index index.html;
+    charset utf-8;
+
+    # --- TLS 1.2/1.3, suites AEAD à confidentialité persistante uniquement (pas de DHE : pas de dhparam) ---
+    ssl_certificate     /etc/letsencrypt/live/${AGBE_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${AGBE_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:AGBE_SSL:10m;
+    ssl_session_tickets off;
+    # Pas d'OCSP stapling : Let's Encrypt n'inclut plus d'URL OCSP dans ses certificats (2025).
+
+    # --- Limites ---
+    client_max_body_size 64k;
+    client_body_buffer_size 16k;
+    client_header_buffer_size 1k;
+    large_client_header_buffers 4 8k;
+    client_body_timeout 10s;
+    client_header_timeout 10s;
+    send_timeout 15s;
+    keepalive_timeout 30s;
+    limit_conn agbe_conn 30;
+
+    include /etc/nginx/snippets/agbe-security-headers.conf;
+
+    if ($request_method !~ ^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$) {
+        return 405;
+    }
+
+    # security.txt (RFC 9116)
+    location = /.well-known/security.txt {
+        default_type text/plain;
+        include /etc/nginx/snippets/agbe-security-headers.conf;
+        return 200 "Contact: mailto:${AGBE_SECURITY_CONTACT}\nExpires: 2027-10-18T00:00:00.000Z\nPreferred-Languages: fr, en\n";
+    }
+
+    # Fichiers cachés (.git, .env…) : jamais servis.
+    location ~ /\.(?!well-known/) {
+        return 404;
+    }
+
+    # --- API ---
+    # Locations imbriquées et insensibles à la casse : /api/AUTH/login ne contourne pas la limite stricte
+    # (le back refuse en plus tout chemin contenant des majuscules).
+    location ^~ /api/ {
+        location ~* ^/api/auth/(refresh|logout)$ {
+            limit_req zone=agbe_session burst=30 nodelay;
+            include /etc/nginx/snippets/agbe-proxy.conf;
+        }
+        # Flux temps réel (SSE) : pas de mise en tampon, connexion longue (ping serveur toutes les 20 s)
+        location ~* ^/api/live/stream$ {
+            limit_req zone=agbe_session burst=10 nodelay;
+            include /etc/nginx/snippets/agbe-proxy-base.conf;
+            proxy_buffering off;
+            proxy_request_buffering on;
+            proxy_read_timeout 1h;
+            proxy_send_timeout 30s;
+        }
+        location ~* ^/api/auth/ {
+            limit_req zone=agbe_auth burst=10 nodelay;
+            include /etc/nginx/snippets/agbe-proxy.conf;
+        }
+        limit_req zone=agbe_api burst=40 nodelay;
+        include /etc/nginx/snippets/agbe-proxy.conf;
+    }
+
+    # --- Ressources hashées : cache long et immuable ---
+    location ^~ /assets/ {
+        try_files $uri =404;
+        access_log off;
+        add_header Cache-Control $agbe_cache_control always;
+        include /etc/nginx/snippets/agbe-security-headers.conf;
+    }
+
+    location ~ ^/(sw\.js|registerSW\.js|workbox-[^/]+\.js|manifest\.webmanifest)$ {
+        try_files $uri =404;
+        add_header Cache-Control $agbe_cache_control always;
+        include /etc/nginx/snippets/agbe-security-headers.conf;
+    }
+
+    location / {
+        try_files $uri /index.html;
+        add_header Cache-Control $agbe_cache_control always;
+        include /etc/nginx/snippets/agbe-security-headers.conf;
+    }
+
+    # Page d'accueil pré-rendue (français) : le build ne connaît pas le domaine, nginx l'écrit dans les liens absolus
+    # (URL canonique, langues, Open Graph, données structurées).
+    location = /index.html {
+        sub_filter '__AGBE_ORIGIN__' 'https://${AGBE_DOMAIN}';
+        sub_filter_once off;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        include /etc/nginx/snippets/agbe-security-headers.conf;
+    }
+
+    # Autres pages publiques pré-rendues (accueil anglais, « Comment jouer », conditions, annonces et contact dans les deux langues) : chacune son adresse,
+    # pour l'indexation et les liens partagés
+    location ~ ^/(en|comment-jouer|conditions|annonces|contact|en/how-to-play|en/terms|en/ads|en/contact)$ {
+        try_files /$1/index.html =404;
+        sub_filter '__AGBE_ORIGIN__' 'https://${AGBE_DOMAIN}';
+        sub_filter_once off;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        include /etc/nginx/snippets/agbe-security-headers.conf;
+    }
+    location ~ ^/(en|comment-jouer|conditions|annonces|contact|en/how-to-play|en/terms|en/ads|en/contact)/(index\.html)?$ {
+        return 301 /$1;
+    }
+
+    # Moteurs de recherche : seules les pages publiques sont à indexer (le reste demande un compte).
+    location = /robots.txt {
+        default_type text/plain;
+        add_header Cache-Control "public, max-age=3600" always;
+        include /etc/nginx/snippets/agbe-security-headers.conf;
+        return 200 "User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /admin\nDisallow: /init\nSitemap: https://${AGBE_DOMAIN}/sitemap.xml\n";
+    }
+    location = /sitemap.xml {
+        default_type application/xml;
+        add_header Cache-Control "public, max-age=3600" always;
+        include /etc/nginx/snippets/agbe-security-headers.conf;
+        return 200 '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">\n<url><loc>https://${AGBE_DOMAIN}/</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en"/></url>\n<url><loc>https://${AGBE_DOMAIN}/en</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en"/></url>\n<url><loc>https://${AGBE_DOMAIN}/comment-jouer</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/comment-jouer"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en/how-to-play"/></url>\n<url><loc>https://${AGBE_DOMAIN}/en/how-to-play</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/comment-jouer"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en/how-to-play"/></url>\n<url><loc>https://${AGBE_DOMAIN}/conditions</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/conditions"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en/terms"/></url>\n<url><loc>https://${AGBE_DOMAIN}/en/terms</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/conditions"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en/terms"/></url>\n<url><loc>https://${AGBE_DOMAIN}/annonces</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/annonces"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en/ads"/></url>\n<url><loc>https://${AGBE_DOMAIN}/en/ads</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/annonces"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en/ads"/></url>\n<url><loc>https://${AGBE_DOMAIN}/contact</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/contact"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en/contact"/></url>\n<url><loc>https://${AGBE_DOMAIN}/en/contact</loc><xhtml:link rel="alternate" hreflang="fr" href="https://${AGBE_DOMAIN}/contact"/><xhtml:link rel="alternate" hreflang="en" href="https://${AGBE_DOMAIN}/en/contact"/></url>\n</urlset>\n';
+    }
+
+    gzip on;
+    gzip_vary on;
+    gzip_comp_level 6;
+    gzip_min_length 512;
+    gzip_types text/css application/javascript application/json application/manifest+json image/svg+xml text/plain application/xml;
+}
